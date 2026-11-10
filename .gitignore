@@ -79,3 +79,6 @@ logs/
 Thumbs.db
 
 # Keep Cargo.lock and package-lock.json tracked for reproducible installs.
+
+# Local install checkout from GitHub (not part of this source tree)
+/.install/
