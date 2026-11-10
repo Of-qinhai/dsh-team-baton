@@ -1,0 +1,50 @@
+{
+  "name": "@token-team/dsh-baton",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "test:integration": "node dev/integration.mjs",
+    "test:flow": "node dev/full-flow.mjs",
+    "test:client": "node dev/client-regression.mjs",
+    "local:setup": "node ../scripts/local.mjs setup",
+    "local:start": "node ../scripts/local.mjs start",
+    "local:check": "node ../scripts/local.mjs check",
+    "preview": "node dev/server.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "connection.js",
+    "session.js",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "license": "MIT",
+  "author": "Baton contributors"
+}

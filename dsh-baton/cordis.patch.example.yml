@@ -1,0 +1,12 @@
+# Copy to cordis.patch.yml and set your own server before installing from source.
+# cordis.patch.yml is local-only and ignored by Git; never put a secret in YAML.
+- insert:
+    - id: baton
+      name: '@token-team/dsh-baton'
+      config:
+        serverUrl: ''
+        secretEnv: BATON_SECRET
+        # secretFile defaults to ~/.config/baton/secret; use an absolute path if set.
+        # displayName: Your name
+        # environments:
+        #   - { key: frontend, label: Frontend, cwd: /absolute/path/to/project }

@@ -1,0 +1,7 @@
+{$BATON_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy baton-server:8080 {
+		# Make the trusted header explicit instead of relying on the default.
+		header_up X-Forwarded-For {remote_host}
+	}
+}
