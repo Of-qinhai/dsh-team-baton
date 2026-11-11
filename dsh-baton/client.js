@@ -11,8 +11,8 @@ window.__ModuleLoader__.load({
     const API = '/api/baton'
     const CSS = `
 .bt-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:5px;background:#dcece3;color:#315c48;font-size:10px;font-weight:700}
-.bt-panel-page{height:100%;min-height:0;display:flex;background:var(--dsw-alias-bg,transparent);overflow:hidden}
-.bt-shell.bt-embedded{width:100%;height:100%;min-height:0;max-height:none;border:0;border-radius:0;box-shadow:none;animation:none}
+.bt-panel-page{height:100%;min-height:600px;width:100%;min-width:0;flex:1 1 auto;align-self:stretch;display:flex;background:var(--dsw-alias-bg,transparent);overflow:hidden}
+.bt-shell.bt-embedded{width:100%;height:100%;min-height:600px;max-height:none;flex:1 1 auto;align-self:stretch;border:0;border-radius:0;box-shadow:none;animation:none}
 .bt-nav-icon{position:relative;display:flex;align-items:center;justify-content:center;flex:none}
 .bt-nav-icon .bt-icon{width:100%;height:100%}
 .bt-nav-badge{position:absolute;top:-4px;right:-5px;min-width:13px;height:13px;padding:0 3px;border-radius:7px;background:#315f4d;color:#fff;font-size:8px;font-weight:700;display:flex;align-items:center;justify-content:center;line-height:1}
@@ -347,7 +347,17 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    function MainPanel() { return h(Panel, { embedded: true }) }
+    class PanelBoundary extends React.Component {
+      constructor(props) { super(props); this.state = { error: null } }
+      static getDerivedStateFromError(error) { return { error } }
+      componentDidCatch(error) { console.error('baton panel crashed', error) }
+      render() {
+        if (this.state.error) return h('div', { style: { padding: 24, color: '#b42318', fontSize: 13 } }, 'Baton 面板加载失败：' + (this.state.error?.message ?? '未知错误'))
+        return this.props.children
+      }
+    }
+
+    function MainPanel() { return h(PanelBoundary, null, h(Panel, { embedded: true })) }
 
     function EnvPicker({ value, options, disabled, onChange }) {
       const [open, setOpen] = useState(false)
@@ -436,10 +446,10 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!active) return undefined
         let timer
-        let active = true
-        async function poll() { await refresh(); if (active) timer = setTimeout(poll, 5000) }
+        let mounted = true
+        async function poll() { await refresh(); if (mounted) timer = setTimeout(poll, 5000) }
         poll()
-        return () => { active = false; clearTimeout(timer) }
+        return () => { mounted = false; clearTimeout(timer) }
       }, [active, refresh])
 
       const online = data?.connection?.state === 'online'
