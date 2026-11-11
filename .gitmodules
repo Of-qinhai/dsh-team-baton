@@ -1,0 +1,4 @@
+[submodule "dsh-baton"]
+	path = dsh-baton
+	url = https://github.com/Of-qinhai/dsh-team-baton-client.git
+	branch = main
