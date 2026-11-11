@@ -7,7 +7,8 @@ pending request; only after they click **Accept and start** does a DSH Session
 get created and receive the first message. The server only relays rooms, tasks,
 and approval state — it never touches code and never stores a Session ID.
 
-Both the plugin and the socket server live in this repository. The public build
+The socket server lives in this repository. The DSH plugin is a separate public
+repository, checked out here as the `dsh-baton/` git submodule. The public build
 connects to no server by default: deploy `baton-server` yourself, or obtain your
 team's endpoint and shared secret from its administrator. The author's runtime is
 not a public service.
@@ -20,7 +21,7 @@ is licensed under [MIT](LICENSE).
 | Path | Contents |
 |---|---|
 | `baton-server/` | Rust WebSocket server (tokio + axum + rusqlite) |
-| `dsh-baton/` | DSH plugin (Host + Web panel) |
+| `dsh-baton/` | DSH plugin submodule → [dsh-team-baton-client](https://github.com/Of-qinhai/dsh-team-baton-client) |
 | `compose.yaml` / `Caddyfile` / `Dockerfile` | Single-host container deployment |
 | `scripts/backup.sh` | Consistent SQLite backup + seven-day retention |
 | `plan.md` | Design and acceptance specification (Chinese) |
@@ -113,17 +114,22 @@ BATON_SECRET=... node peer.mjs join <userId> <name> <code> --accept
 Install inside DSH:
 
 ```text
-plugin_manager install_bundle target=/absolute/path/to/dsh-baton
+plugin_manager install_bundle target=/absolute/path/to/dsh-team-baton-client
 ```
 
-Before installing from a fresh clone, copy the example patch:
+The plugin has its own repository:
 
 ```sh
-cp dsh-baton/cordis.patch.example.yml dsh-baton/cordis.patch.yml
+git clone https://github.com/Of-qinhai/dsh-team-baton-client.git dsh-team-baton-client
+cd dsh-team-baton-client
+cp cordis.patch.example.yml cordis.patch.yml
 ```
 
+If you cloned the server repository with `--recurse-submodules`, the same files
+live under `dsh-baton/`; install target is still the plugin directory root.
+
 Fill in your own server URL and directories, then install.
-`cordis.patch.yml` is Git-ignored, so your local configuration is not published.
+`cordis.patch.yml` is Git-ignored in the plugin repository, so your local configuration is not published.
 You can also add a complete override row to the profile patch instead.
 
 ```yaml

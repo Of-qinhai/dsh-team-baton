@@ -15,7 +15,8 @@
 | `node_modules`、Rust target、Cargo 缓存 | 忽略 |
 | `dsh-baton/cordis.patch.yml` | 保留本机配置并忽略；提交 `cordis.patch.example.yml` |
 | 公开插件安装包 | 默认不配置服务地址；不打包密钥、本机配置和开发依赖 |
-| 插件/服务端源码、测试、部署模板、两份 lock 文件 | 保留在仓库 |
+| 服务端源码、测试、部署模板、两份 lock 文件 | 保留在仓库 |
+| DSH 插件源码 | 独立仓库 [dsh-team-baton-client](https://github.com/Of-qinhai/dsh-team-baton-client)，在本仓库作为 `dsh-baton/` submodule 引入 |
 | `dist/` 和压缩包 | 忽略；使用 Release 附件分发 |
 | `API-NOTES.md` | 保留在源码作开发记录；已清除测试会话 ID、房间号；不进入发布包 |
 | 本地测试数据库、`secrets/server.env`、`.DS_Store` | 已从工作目录删除（`.baton-secret` 仍需本地保留，已忽略） |
@@ -44,9 +45,10 @@
    浏览器回归需要另备 Playwright 和 Chromium。
 4. 在仓库根目录执行 `sh scripts/package-plugin.sh`。将生成的
    `dist/dsh-baton-<版本>.tgz` 附到对应版本的 Release，不把 `dist/` 提交进源码。
-5. 用户下载插件包，按包内 INSTALL.md 配置自己的服务端、密钥和环境目录。
-   从源码安装时，先复制 `dsh-baton/cordis.patch.example.yml` 到
-   `dsh-baton/cordis.patch.yml`，填好配置再安装。
+5. 用户可以直接 clone 插件仓库 `dsh-team-baton-client`，复制其中的
+   `cordis.patch.example.yml` 为 `cordis.patch.yml`，填好服务端、密钥和环境目录后，
+   从插件仓库根目录安装；也可以下载 Release 插件包按包内 `INSTALL.md` 安装。
+   克隆本服务端仓库时使用 `--recurse-submodules` 才会带上 `dsh-baton/`。
 
 私有团队包可以显式预填自己的服务地址：
 

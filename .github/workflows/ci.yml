@@ -12,6 +12,8 @@ jobs:
         working-directory: baton-server
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -25,6 +27,8 @@ jobs:
         working-directory: dsh-baton
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 22

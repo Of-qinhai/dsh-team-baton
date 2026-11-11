@@ -5,7 +5,7 @@
 把一件事从一个人的 DSH 递给另一个人：对方面板出现待批准请求，点「接受并启动」才创建会话、提交第一条消息。
 服务端只做房间、任务和审批状态，不碰代码、不保存会话 ID。
 
-插件和 socket 服务端均包含在本仓库。公开版本默认不连接任何服务器；使用者自行部署
+socket 服务端在本仓库；DSH 插件是独立公开仓库，以 `dsh-baton/` git submodule 的形式引入。公开版本默认不连接任何服务器；使用者自行部署
 `baton-server`，或向自己团队的管理员获取服务地址与共享密钥。作者的运行环境不是公共服务。
 
 公开仓库准备和首版发布说明见 [PUBLICATION.md](PUBLICATION.md)。本项目使用 [MIT](LICENSE) 许可证。
@@ -15,7 +15,7 @@
 | 位置 | 内容 |
 |---|---|
 | `baton-server/` | Rust WebSocket 服务端（tokio + axum + rusqlite） |
-| `dsh-baton/` | DSH 插件（Host + Web 面板） |
+| `dsh-baton/` | DSH 插件 submodule → [dsh-team-baton-client](https://github.com/Of-qinhai/dsh-team-baton-client) |
 | `compose.yaml` / `Caddyfile` / `Dockerfile` | 单机容器部署 |
 | `scripts/backup.sh` | SQLite 一致性备份 + 七天清理 |
 | `plan.md` | 方案与验收规格 |
@@ -83,11 +83,19 @@ BATON_SECRET=... node peer.mjs join <userId> <name> <code> --accept
 安装（在 DSH 里）：
 
 ```text
-plugin_manager install_bundle target=/绝对路径/dsh-baton
+plugin_manager install_bundle target=/绝对路径/dsh-team-baton-client
 ```
 
-从公开仓库直接安装前，先执行 `cp dsh-baton/cordis.patch.example.yml dsh-baton/cordis.patch.yml`，
-在生成的本机文件里填写自己的服务地址和目录，再执行安装。
+插件有独立公开仓库：
+
+```sh
+git clone https://github.com/Of-qinhai/dsh-team-baton-client.git dsh-team-baton-client
+cd dsh-team-baton-client
+cp cordis.patch.example.yml cordis.patch.yml
+```
+
+在生成的本机文件里填写自己的服务地址和目录，再执行安装。用 `--recurse-submodules`
+克隆服务端仓库时，同样的文件在 `dsh-baton/` 下，安装目标仍是插件目录根。
 `cordis.patch.yml` 被 Git 忽略，不会公开你的配置；也可以在 profile patch 中完整覆盖配置。
 
 ```yaml
