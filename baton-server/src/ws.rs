@@ -428,6 +428,7 @@ async fn handle_request(
             secret,
             user_id,
             display_name,
+            environments,
             ..
         } => {
             if authed.is_some() {
@@ -441,6 +442,7 @@ async fn handle_request(
                 &secret,
                 user_id,
                 display_name,
+                environments,
                 generation,
                 tx,
                 close_tx,
@@ -537,6 +539,26 @@ async fn handle_request(
                 Err(error) => respond_store_error(&id, tx, error),
             }
         }
+        RequestKind::EnvSet { environments } => {
+            if !state
+                .limits
+                .allow(format!("env:{}", identity.user_id), ROOM_RATE_LIMIT)
+            {
+                return send_error(tx, Some(&id), ErrorCode::RateLimited);
+            }
+            match state
+                .store
+                .set_environments(&identity.user_id, environments)
+                .await
+            {
+                Ok(reply) => {
+                    let close = send_data(tx, &id, json!({}));
+                    state.notify_users(&reply.peers);
+                    close
+                }
+                Err(error) => respond_store_error(&id, tx, error),
+            }
+        }
         RequestKind::TaskSend {
             task_id,
             room,
@@ -598,6 +620,32 @@ async fn handle_request(
                 Err(error) => respond_store_error(&id, tx, error),
             }
         }
+        kind @ (RequestKind::TaskArchive { .. }
+        | RequestKind::TaskRestore { .. }
+        | RequestKind::TaskDelete { .. }) => {
+            let (task_id, visibility) = match kind {
+                RequestKind::TaskArchive { task_id } => (task_id, "archived"),
+                RequestKind::TaskRestore { task_id } => (task_id, "active"),
+                RequestKind::TaskDelete { task_id } => (task_id, "deleted"),
+                _ => unreachable!(),
+            };
+            match state
+                .store
+                .set_task_visibility(&identity.user_id, &task_id, visibility, now_ms())
+                .await
+            {
+                Ok(reply) => {
+                    let close = send_data(
+                        tx,
+                        &id,
+                        json!({"taskId": reply.task_id, "purged": reply.purged}),
+                    );
+                    state.notify_users(&reply.notify);
+                    close
+                }
+                Err(error) => respond_store_error(&id, tx, error),
+            }
+        }
         RequestKind::Ping => send_data(tx, &id, json!({})),
         RequestKind::Hello { .. } => unreachable!("hello handled above"),
     }
@@ -611,6 +659,7 @@ async fn handle_hello(
     secret: &str,
     user_id: String,
     display_name: String,
+    environments: Option<Vec<crate::protocol::EnvView>>,
     generation: u64,
     tx: &mpsc::Sender<Outbound>,
     close_tx: &watch::Sender<bool>,
@@ -628,7 +677,11 @@ async fn handle_hello(
         return true;
     }
 
-    match state.store.hello(&user_id, &display_name).await {
+    match state
+        .store
+        .hello(&user_id, &display_name, environments)
+        .await
+    {
         Ok(reply) => {
             let handle = ConnHandle {
                 generation,
@@ -922,6 +975,46 @@ mod tests {
         assert_eq!(sync_a["type"], "ok");
         assert_eq!(sync_a["data"]["tasks"][0]["status"], "accepted");
         assert!(sync_a["data"]["tasks"][0].get("brief").is_none());
+
+        let archived = call(&mut a, "archive", "task.archive", json!({"taskId": UUID_T})).await;
+        assert_eq!(archived["data"], json!({"taskId": UUID_T, "purged": false}));
+        expect_state_changed(&mut a).await;
+        expect_state_changed(&mut b).await;
+        let archived_sync = call(&mut a, "sync-archived", "sync", json!({})).await;
+        assert_eq!(
+            archived_sync["data"]["tasks"][0]["fromVisibility"],
+            "archived"
+        );
+        let restored = call(&mut a, "restore", "task.restore", json!({"taskId": UUID_T})).await;
+        assert_eq!(restored["type"], "ok");
+        call(
+            &mut a,
+            "archive-again",
+            "task.archive",
+            json!({"taskId": UUID_T}),
+        )
+        .await;
+        let deleted = call(&mut a, "delete", "task.delete", json!({"taskId": UUID_T})).await;
+        assert_eq!(deleted["data"]["purged"], false);
+        let hidden_sync = call(&mut a, "sync-deleted", "sync", json!({})).await;
+        assert!(hidden_sync["data"]["tasks"].as_array().unwrap().is_empty());
+        call(
+            &mut b,
+            "archive-b",
+            "task.archive",
+            json!({"taskId": UUID_T}),
+        )
+        .await;
+        let purged = call(&mut b, "delete-b", "task.delete", json!({"taskId": UUID_T})).await;
+        assert_eq!(purged["data"]["purged"], true);
+        let retry = call(
+            &mut b,
+            "delete-b-retry",
+            "task.delete",
+            json!({"taskId": UUID_T}),
+        )
+        .await;
+        assert_eq!(retry["data"]["purged"], true);
 
         a.close(None).await.unwrap();
         b.close(None).await.unwrap();

@@ -102,6 +102,10 @@ pub enum RequestKind {
         secret: String,
         user_id: String,
         display_name: String,
+        environments: Option<Vec<EnvView>>,
+    },
+    EnvSet {
+        environments: Vec<EnvView>,
     },
     Sync,
     RoomCreate {
@@ -130,6 +134,15 @@ pub enum RequestKind {
     TaskRespond {
         task_id: String,
         decision: Decision,
+    },
+    TaskArchive {
+        task_id: String,
+    },
+    TaskRestore {
+        task_id: String,
+    },
+    TaskDelete {
+        task_id: String,
     },
     Ping,
 }
@@ -173,11 +186,13 @@ pub fn parse_request(text: &str) -> Result<Request, ProtocolError> {
             let secret = required_str(data, "secret", &id)?;
             let user_id = uuid_field(data, "userId", &id)?;
             let display_name = name_field(data, "displayName", &id)?;
+            let environments = environments_field(data, &id)?;
             RequestKind::Hello {
                 protocol_version: version,
                 secret: secret.to_owned(),
                 user_id,
                 display_name,
+                environments,
             }
         }
         "sync" => {
@@ -231,6 +246,15 @@ pub fn parse_request(text: &str) -> Result<Request, ProtocolError> {
                 task_id: uuid_field(data, "taskId", &id)?,
             }
         }
+        "task.archive" | "task.restore" | "task.delete" => {
+            let data = required_object(data, &id)?;
+            let task_id = uuid_field(data, "taskId", &id)?;
+            match ty {
+                "task.archive" => RequestKind::TaskArchive { task_id },
+                "task.restore" => RequestKind::TaskRestore { task_id },
+                _ => RequestKind::TaskDelete { task_id },
+            }
+        }
         "task.respond" => {
             let data = required_object(data, &id)?;
             let task_id = uuid_field(data, "taskId", &id)?;
@@ -241,6 +265,12 @@ pub fn parse_request(text: &str) -> Result<Request, ProtocolError> {
             };
             RequestKind::TaskRespond { task_id, decision }
         }
+        "env.set" => {
+            let data = required_object(data, &id)?;
+            RequestKind::EnvSet {
+                environments: environments_field(data, &id)?.unwrap_or_default(),
+            }
+        }
         "ping" => {
             empty_data(data, &id)?;
             RequestKind::Ping
@@ -249,6 +279,60 @@ pub fn parse_request(text: &str) -> Result<Request, ProtocolError> {
     };
 
     Ok(Request { id, kind })
+}
+
+/// Environment metadata a client advertises. Paths never cross the wire.
+fn environments_field(
+    data: &Map<String, Value>,
+    id: &str,
+) -> Result<Option<Vec<EnvView>>, ProtocolError> {
+    let Some(value) = data.get("environments") else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err(ProtocolError::invalid(Some(id.to_owned())));
+    };
+    if items.len() > 20 {
+        return Err(ProtocolError::invalid(Some(id.to_owned())));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut environments = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(object) = item.as_object() else {
+            return Err(ProtocolError::invalid(Some(id.to_owned())));
+        };
+        let key = object
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProtocolError::invalid(Some(id.to_owned())))?;
+        if key.is_empty()
+            || key.len() > 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            || !seen.insert(key.to_owned())
+        {
+            return Err(ProtocolError::invalid(Some(id.to_owned())));
+        }
+        let label = match object.get("label") {
+            None => key.to_owned(),
+            Some(value) => {
+                let label = value
+                    .as_str()
+                    .ok_or_else(|| ProtocolError::invalid(Some(id.to_owned())))?
+                    .trim();
+                if label.is_empty() || label.chars().count() > 40 {
+                    return Err(ProtocolError::invalid(Some(id.to_owned())));
+                }
+                label.to_owned()
+            }
+        };
+        environments.push(EnvView {
+            key: key.to_owned(),
+            label,
+        });
+    }
+    Ok(Some(environments))
 }
 
 fn required_object<'a>(
@@ -393,11 +477,19 @@ pub struct Peer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvView {
+    pub key: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberView {
     pub user_id: String,
     pub display_name: String,
     pub online: bool,
+    #[serde(default)]
+    pub environments: Vec<EnvView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,8 +512,16 @@ pub struct TaskSummary {
     pub env: String,
     pub title: String,
     pub status: String,
+    #[serde(default = "active_visibility")]
+    pub from_visibility: String,
+    #[serde(default = "active_visibility")]
+    pub to_visibility: String,
     pub created_at: i64,
     pub expires_at: i64,
+}
+
+fn active_visibility() -> String {
+    "active".to_owned()
 }
 
 #[cfg(test)]
@@ -434,6 +534,35 @@ mod tests {
 
     fn parse(value: Value) -> Result<Request, ProtocolError> {
         parse_request(&value.to_string())
+    }
+
+    #[test]
+    fn task_visibility_requests_require_a_valid_task_id() {
+        for ty in ["task.archive", "task.restore", "task.delete"] {
+            assert!(parse(json!({"id":"r","type":ty,"data":{"taskId":UUID_T}})).is_ok());
+            for data in [json!({}), json!({"taskId":"invalid"})] {
+                assert_eq!(
+                    parse(json!({"id":"r","type":ty,"data":data}))
+                        .unwrap_err()
+                        .code,
+                    ErrorCode::InvalidRequest
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_task_summaries_default_to_active_visibility() {
+        let task: TaskSummary = serde_json::from_value(json!({
+            "taskId":UUID_T,"room":"ABCD23",
+            "from":{"userId":UUID_A,"displayName":"A"},
+            "to":{"userId":UUID_B,"displayName":"B"},
+            "env":"e","title":"t","status":"pending","createdAt":1,"expiresAt":2
+        }))
+        .unwrap();
+        let value = serde_json::to_value(task).unwrap();
+        assert_eq!(value["fromVisibility"], "active");
+        assert_eq!(value["toVisibility"], "active");
     }
 
     #[test]
@@ -462,6 +591,61 @@ mod tests {
                 assert_eq!(display_name, "Alice");
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn environment_metadata_is_validated_and_paths_are_ignored() {
+        let req = parse(json!({
+            "id": "r", "type": "hello",
+            "data": {
+                "protocolVersion": 1, "secret": "s".repeat(32), "userId": UUID_A, "displayName": "A",
+                "environments": [
+                    {"key": "frontend", "label": "  前端  ", "cwd": "/not/sent"},
+                    {"key": "backend"}
+                ]
+            }
+        }))
+        .unwrap();
+        match req.kind {
+            RequestKind::Hello {
+                environments: Some(environments),
+                ..
+            } => {
+                assert_eq!(
+                    environments,
+                    vec![
+                        EnvView {
+                            key: "frontend".into(),
+                            label: "前端".into()
+                        },
+                        EnvView {
+                            key: "backend".into(),
+                            label: "backend".into()
+                        },
+                    ]
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let set = parse(json!({
+            "id": "r", "type": "env.set",
+            "data": {"environments": [{"key": "design", "label": "设计"}]}
+        }))
+        .unwrap();
+        match set.kind {
+            RequestKind::EnvSet { environments } => assert_eq!(environments[0].key, "design"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        for bad in [
+            json!([{"key": "a/b"}]),
+            json!([{"key": "frontend"}, {"key": "frontend"}]),
+            json!([{"key": "frontend", "label": ""}]),
+        ] {
+            let request = json!({"id": "r", "type": "env.set", "data": {"environments": bad}});
+            assert!(parse(request).is_err());
         }
     }
 
@@ -622,8 +806,8 @@ mod tests {
 
     #[test]
     fn maximum_sync_payload_fits_response_limit() {
-        let name = "名".repeat(40);
-        let title = "标".repeat(120);
+        let name = "\0".repeat(40);
+        let title = "\0".repeat(120);
         let env = "e".repeat(64);
         let rooms = (0..10)
             .map(|room| RoomView {
@@ -636,6 +820,12 @@ mod tests {
                         user_id: format!("00000000-0000-0000-0000-{:012x}", member),
                         display_name: name.clone(),
                         online: true,
+                        environments: (0..20)
+                            .map(|n| EnvView {
+                                key: format!("{n:064}"),
+                                label: "\0".repeat(40),
+                            })
+                            .collect(),
                     })
                     .collect(),
             })
@@ -655,6 +845,8 @@ mod tests {
                 env: env.clone(),
                 title: title.clone(),
                 status: STATUS_PENDING.into(),
+                from_visibility: "active".into(),
+                to_visibility: "active".into(),
                 created_at: 1,
                 expires_at: 2,
             })
@@ -678,6 +870,7 @@ mod tests {
                 user_id: UUID_A.into(),
                 display_name: "A".into(),
                 online: true,
+                environments: Vec::new(),
             }],
         };
         let value = serde_json::to_value(room).unwrap();
@@ -700,6 +893,8 @@ mod tests {
             env: "frontend".into(),
             title: "t".into(),
             status: STATUS_PENDING.into(),
+            from_visibility: "active".into(),
+            to_visibility: "active".into(),
             created_at: 1,
             expires_at: 2,
         };

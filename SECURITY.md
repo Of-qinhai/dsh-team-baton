@@ -23,5 +23,9 @@ or server addresses in a report.
 - Shared-secret authentication is intentional; unauthorized cross-team access is
   still a vulnerability.
 - Task briefs are stored server-side for seven days and included in backups.
+- Per-user deletion first archives an item. After both participants confirm
+  permanent deletion, its task/brief is removed from the live database; only an
+  ID/expiry tombstone remains until the original expiry to prevent retry replay.
+  Existing backups follow their retention period. Linked DSH sessions are not deleted.
 - The server is single-process and has no account system. See `plan.md` for the
   accepted first-version limits.

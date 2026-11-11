@@ -6,7 +6,8 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::protocol::{
-    MemberView, Peer, RoomView, TaskSummary, ROOM_CODE_CHARSET, ROOM_CODE_LEN, STATUS_PENDING,
+    EnvView, MemberView, Peer, RoomView, TaskSummary, ROOM_CODE_CHARSET, ROOM_CODE_LEN,
+    STATUS_PENDING,
 };
 
 pub const TASK_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -30,6 +31,10 @@ CREATE TABLE members (
     PRIMARY KEY (room_code, user_id),
     FOREIGN KEY (room_code) REFERENCES rooms(code) ON DELETE CASCADE
 );
+CREATE TABLE profiles (
+    user_id TEXT PRIMARY KEY,
+    environments TEXT NOT NULL DEFAULT '[]'
+);
 CREATE TABLE tasks (
     task_id TEXT PRIMARY KEY,
     room TEXT NOT NULL,
@@ -50,8 +55,17 @@ CREATE INDEX idx_tasks_expires ON tasks(expires_at);
 CREATE INDEX idx_members_user ON members(user_id);
 "#;
 
+const VISIBILITY_SCHEMA: &str = r#"
+ALTER TABLE tasks ADD COLUMN from_visibility TEXT NOT NULL DEFAULT 'active'
+    CHECK (from_visibility IN ('active', 'archived', 'deleted'));
+ALTER TABLE tasks ADD COLUMN to_visibility TEXT NOT NULL DEFAULT 'active'
+    CHECK (to_visibility IN ('active', 'archived', 'deleted'));
+CREATE TABLE task_tombstones (task_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+CREATE INDEX idx_task_tombstones_expires ON task_tombstones(expires_at);
+"#;
+
 const TASK_SUMMARY_COLUMNS: &str = "task_id, room, from_user, from_name, to_user, to_name, \
-     env, title, status, created_at, expires_at";
+     env, title, status, created_at, expires_at, from_visibility, to_visibility";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -133,6 +147,13 @@ pub struct RespondTaskReply {
 }
 
 #[derive(Debug, Clone)]
+pub struct TaskVisibilityReply {
+    pub task_id: String,
+    pub purged: bool,
+    pub notify: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SyncReply {
     pub rooms: Vec<RoomView>,
     pub tasks: Vec<TaskSummary>,
@@ -161,13 +182,23 @@ impl Store {
             }
         }
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 1 {
+        if version > 3 {
             return Err(StoreError::UnsupportedSchema(version));
         }
-        if version == 0 {
+        if version < 3 {
             let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA)?;
-            tx.pragma_update(None, "user_version", 1_i64)?;
+            if version == 0 {
+                tx.execute_batch(SCHEMA)?;
+            } else if version == 1 {
+                tx.execute_batch(
+                    "CREATE TABLE profiles (\
+                    user_id TEXT PRIMARY KEY,\
+                    environments TEXT NOT NULL DEFAULT '[]'\
+                );",
+                )?;
+            }
+            tx.execute_batch(VISIBILITY_SCHEMA)?;
+            tx.pragma_update(None, "user_version", 3_i64)?;
             tx.commit()?;
         }
 
@@ -199,10 +230,25 @@ impl Store {
         reply_rx.await.map_err(|_| StoreError::Unavailable)?
     }
 
-    pub async fn hello(&self, user_id: &str, display_name: &str) -> StoreResult<HelloReply> {
+    pub async fn hello(
+        &self,
+        user_id: &str,
+        display_name: &str,
+        environments: Option<Vec<EnvView>>,
+    ) -> StoreResult<HelloReply> {
         let user_id = user_id.to_owned();
         let display_name = display_name.to_owned();
-        self.call(move |conn| hello_impl(conn, &user_id, &display_name))
+        self.call(move |conn| hello_impl(conn, &user_id, &display_name, environments.as_deref()))
+            .await
+    }
+
+    pub async fn set_environments(
+        &self,
+        user_id: &str,
+        environments: Vec<EnvView>,
+    ) -> StoreResult<PeersReply> {
+        let user_id = user_id.to_owned();
+        self.call(move |conn| set_environments_impl(conn, &user_id, &environments))
             .await
     }
 
@@ -309,9 +355,30 @@ impl Store {
 
     pub async fn delete_expired(&self, now_ms: i64) -> StoreResult<u64> {
         self.call(move |conn| {
-            conn.execute("DELETE FROM tasks WHERE expires_at <= ?1", params![now_ms])
-                .map(|count| count as u64)
-                .map_err(Into::into)
+            let tx = conn.transaction()?;
+            let count = tx.execute("DELETE FROM tasks WHERE expires_at <= ?1", params![now_ms])?;
+            tx.execute(
+                "DELETE FROM task_tombstones WHERE expires_at <= ?1",
+                params![now_ms],
+            )?;
+            tx.commit()?;
+            Ok(count as u64)
+        })
+        .await
+    }
+
+    pub async fn set_task_visibility(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        visibility: &str,
+        now_ms: i64,
+    ) -> StoreResult<TaskVisibilityReply> {
+        let user_id = user_id.to_owned();
+        let task_id = task_id.to_owned();
+        let visibility = visibility.to_owned();
+        self.call(move |conn| {
+            set_task_visibility_impl(conn, &user_id, &task_id, &visibility, now_ms)
         })
         .await
     }
@@ -343,6 +410,8 @@ struct TaskRow {
     title: String,
     brief: String,
     status: String,
+    from_visibility: String,
+    to_visibility: String,
     created_at: i64,
     expires_at: i64,
 }
@@ -363,23 +432,64 @@ impl TaskRow {
             env: self.env.clone(),
             title: self.title.clone(),
             status: self.status.clone(),
+            from_visibility: self.from_visibility.clone(),
+            to_visibility: self.to_visibility.clone(),
             created_at: self.created_at,
             expires_at: self.expires_at,
         }
     }
 }
 
-fn hello_impl(conn: &mut Connection, user_id: &str, display_name: &str) -> StoreResult<HelloReply> {
+fn encode_environments(environments: &[EnvView]) -> String {
+    serde_json::to_string(environments).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn decode_environments(text: &str) -> Vec<EnvView> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+fn hello_impl(
+    conn: &mut Connection,
+    user_id: &str,
+    display_name: &str,
+    environments: Option<&[EnvView]>,
+) -> StoreResult<HelloReply> {
     let tx = conn.transaction()?;
     let changed = tx.execute(
         "UPDATE members SET display_name = ?1 WHERE user_id = ?2 AND display_name <> ?1",
         params![display_name, user_id],
     )? > 0;
+    let mut env_changed = false;
+    if let Some(environments) = environments {
+        let environments_json = encode_environments(environments);
+        env_changed = tx.execute(
+            "INSERT INTO profiles (user_id, environments) VALUES (?1, ?2) \
+             ON CONFLICT(user_id) DO UPDATE SET environments = excluded.environments \
+             WHERE profiles.environments <> excluded.environments",
+            params![user_id, environments_json],
+        )? > 0;
+    }
     let peers = peer_ids(&tx, user_id)?;
     tx.commit()?;
     Ok(HelloReply {
-        name_changed: changed,
+        name_changed: changed || env_changed,
         peers,
+    })
+}
+
+fn set_environments_impl(
+    conn: &mut Connection,
+    user_id: &str,
+    environments: &[EnvView],
+) -> StoreResult<PeersReply> {
+    let json = encode_environments(environments);
+    conn.execute(
+        "INSERT INTO profiles (user_id, environments) VALUES (?1, ?2) \
+         ON CONFLICT(user_id) DO UPDATE SET environments = excluded.environments",
+        params![user_id, json],
+    )?;
+    Ok(PeersReply {
+        peers: peer_ids(conn, user_id)?,
     })
 }
 
@@ -400,7 +510,8 @@ fn sync_impl(conn: &mut Connection, user_id: &str, now_ms: i64) -> StoreResult<S
     let tasks = {
         let sql = format!(
             "SELECT {TASK_SUMMARY_COLUMNS} FROM tasks \
-             WHERE (from_user = ?1 OR to_user = ?1) AND expires_at > ?2 \
+             WHERE ((from_user = ?1 AND from_visibility != 'deleted') \
+                OR (to_user = ?1 AND to_visibility != 'deleted')) AND expires_at > ?2 \
              ORDER BY created_at, task_id"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -459,6 +570,7 @@ fn create_room_impl(
             user_id: user_id.to_owned(),
             display_name: display_name.to_owned(),
             online: false,
+            environments: Vec::new(),
         }],
     };
     tx.commit()?;
@@ -621,6 +733,18 @@ fn send_task_impl(
     now_ms: i64,
 ) -> StoreResult<SendTaskReply> {
     let tx = conn.transaction()?;
+    let tombstoned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_tombstones WHERE task_id = ?1 AND expires_at > ?2)",
+        params![task_id, now_ms],
+        |row| row.get(0),
+    )?;
+    if tombstoned {
+        return Err(StoreError::Conflict);
+    }
+    tx.execute(
+        "DELETE FROM task_tombstones WHERE task_id = ?1 AND expires_at <= ?2",
+        params![task_id, now_ms],
+    )?;
     if let Some(existing) = task_row(&tx, task_id)? {
         if existing.expires_at <= now_ms {
             tx.execute("DELETE FROM tasks WHERE task_id = ?1", params![task_id])?;
@@ -651,6 +775,19 @@ fn send_task_impl(
         return Err(StoreError::Invalid);
     }
     let to_name = member_name(&tx, room, to_user)?.ok_or(StoreError::NotFound)?;
+    if let Some(advertised) = tx
+        .query_row(
+            "SELECT environments FROM profiles WHERE user_id = ?1",
+            params![to_user],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let environments = decode_environments(&advertised);
+        if !environments.is_empty() && !environments.iter().any(|entry| entry.key == env) {
+            return Err(StoreError::Invalid);
+        }
+    }
 
     if related_task_count(&tx, from_user, now_ms)? >= MAX_RELATED_TASKS
         || related_task_count(&tx, to_user, now_ms)? >= MAX_RELATED_TASKS
@@ -696,6 +833,8 @@ fn send_task_impl(
             env: env.to_owned(),
             title: title.to_owned(),
             status: STATUS_PENDING.to_owned(),
+            from_visibility: "active".to_owned(),
+            to_visibility: "active".to_owned(),
             created_at: now_ms,
             expires_at,
         },
@@ -716,6 +855,11 @@ fn get_task_impl(
     }
     if row.from_user != user_id && row.to_user != user_id {
         return Err(StoreError::Forbidden);
+    }
+    if (row.from_user == user_id && row.from_visibility == "deleted")
+        || (row.to_user == user_id && row.to_visibility == "deleted")
+    {
+        return Err(StoreError::NotFound);
     }
     let brief = row.brief.clone();
     Ok(GetTaskReply {
@@ -738,6 +882,9 @@ fn respond_task_impl(
     }
     if row.to_user != user_id {
         return Err(StoreError::Forbidden);
+    }
+    if row.to_visibility == "deleted" {
+        return Err(StoreError::NotFound);
     }
     if row.status == decision {
         let task = row.summary();
@@ -763,6 +910,75 @@ fn respond_task_impl(
     })
 }
 
+fn set_task_visibility_impl(
+    conn: &mut Connection,
+    user_id: &str,
+    task_id: &str,
+    visibility: &str,
+    now_ms: i64,
+) -> StoreResult<TaskVisibilityReply> {
+    if !matches!(visibility, "active" | "archived" | "deleted") {
+        return Err(StoreError::Invalid);
+    }
+    let tx = conn.transaction()?;
+    let Some(mut row) = task_row(&tx, task_id)? else {
+        if visibility != "deleted" {
+            return Err(StoreError::NotFound);
+        }
+        tx.commit()?;
+        return Ok(TaskVisibilityReply {
+            task_id: task_id.to_owned(),
+            purged: true,
+            notify: Vec::new(),
+        });
+    };
+    let (column, current) = if row.from_user == user_id {
+        ("from_visibility", &mut row.from_visibility)
+    } else if row.to_user == user_id {
+        ("to_visibility", &mut row.to_visibility)
+    } else {
+        return Err(StoreError::Forbidden);
+    };
+    if row.expires_at <= now_ms {
+        return Err(StoreError::NotFound);
+    }
+    if current == visibility {
+        tx.commit()?;
+        return Ok(TaskVisibilityReply {
+            task_id: task_id.to_owned(),
+            purged: false,
+            notify: Vec::new(),
+        });
+    }
+    if !matches!(
+        (current.as_str(), visibility),
+        ("active", "archived") | ("archived", "active") | ("archived", "deleted")
+    ) {
+        return Err(StoreError::Conflict);
+    }
+    *current = visibility.to_owned();
+    let purged = row.from_visibility == "deleted" && row.to_visibility == "deleted";
+    if purged {
+        // Keep only the retry key until the original task's seven-day expiry.
+        tx.execute(
+            "INSERT INTO task_tombstones (task_id, expires_at) VALUES (?1, ?2)",
+            params![task_id, row.expires_at],
+        )?;
+        tx.execute("DELETE FROM tasks WHERE task_id = ?1", params![task_id])?;
+    } else {
+        tx.execute(
+            &format!("UPDATE tasks SET {column} = ?1 WHERE task_id = ?2"),
+            params![visibility, task_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(TaskVisibilityReply {
+        task_id: task_id.to_owned(),
+        purged,
+        notify: vec![row.from_user, row.to_user],
+    })
+}
+
 fn room_view(conn: &Connection, code: &str) -> StoreResult<RoomView> {
     let (name, owner_id, created_at): (String, String, i64) = conn.query_row(
         "SELECT name, owner_id, created_at FROM rooms WHERE code = ?1",
@@ -771,14 +987,16 @@ fn room_view(conn: &Connection, code: &str) -> StoreResult<RoomView> {
     )?;
     let members = {
         let mut stmt = conn.prepare(
-            "SELECT user_id, display_name FROM members WHERE room_code = ?1 \
-             ORDER BY joined_at, user_id",
+            "SELECT m.user_id, m.display_name, COALESCE(p.environments, '[]') \
+             FROM members m LEFT JOIN profiles p ON p.user_id = m.user_id \
+             WHERE m.room_code = ?1 ORDER BY m.joined_at, m.user_id",
         )?;
         let rows = stmt.query_map(params![code], |row| {
             Ok(MemberView {
                 user_id: row.get(0)?,
                 display_name: row.get(1)?,
                 online: false,
+                environments: decode_environments(&row.get::<_, String>(2)?),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
@@ -821,7 +1039,9 @@ fn peer_ids(conn: &Connection, user_id: &str) -> StoreResult<Vec<String>> {
 
 fn related_task_count(conn: &Connection, user_id: &str, now_ms: i64) -> StoreResult<i64> {
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM tasks WHERE expires_at > ?1 AND (from_user = ?2 OR to_user = ?2)",
+        "SELECT COUNT(*) FROM tasks WHERE expires_at > ?1 \
+         AND ((from_user = ?2 AND from_visibility != 'deleted') \
+           OR (to_user = ?2 AND to_visibility != 'deleted'))",
         params![now_ms, user_id],
         |row| row.get(0),
     )?)
@@ -829,7 +1049,8 @@ fn related_task_count(conn: &Connection, user_id: &str, now_ms: i64) -> StoreRes
 
 fn pending_inbox_count(conn: &Connection, user_id: &str, now_ms: i64) -> StoreResult<i64> {
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM tasks WHERE to_user = ?1 AND status = ?2 AND expires_at > ?3",
+        "SELECT COUNT(*) FROM tasks WHERE to_user = ?1 AND status = ?2 AND expires_at > ?3 \
+         AND to_visibility != 'deleted'",
         params![user_id, STATUS_PENDING, now_ms],
         |row| row.get(0),
     )?)
@@ -857,6 +1078,8 @@ fn task_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSummar
         env: row.get(6)?,
         title: row.get(7)?,
         status: row.get(8)?,
+        from_visibility: row.get(11)?,
+        to_visibility: row.get(12)?,
         created_at: row.get(9)?,
         expires_at: row.get(10)?,
     })
@@ -873,9 +1096,11 @@ fn task_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         env: row.get(6)?,
         title: row.get(7)?,
         status: row.get(8)?,
+        from_visibility: row.get(11)?,
+        to_visibility: row.get(12)?,
         created_at: row.get(9)?,
         expires_at: row.get(10)?,
-        brief: row.get(11)?,
+        brief: row.get(13)?,
     })
 }
 
@@ -956,6 +1181,241 @@ mod tests {
             .await
             .unwrap()
             .code
+    }
+
+    #[tokio::test]
+    async fn visibility_is_per_party_and_purges_only_after_both_delete() {
+        let db = TestDb::new();
+        let owner = uid(1);
+        let member = uid(2);
+        let code = create_room(&db, &owner, "room").await;
+        db.store().join_room(&member, "B", &code, T0).await.unwrap();
+        let task_id = tid(901);
+        db.store()
+            .send_task(
+                &owner,
+                &task_id,
+                &code,
+                &member,
+                "e",
+                "title",
+                "private brief",
+                T0,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.store()
+                .set_task_visibility(&owner, &task_id, "deleted", T0)
+                .await,
+            Err(StoreError::Conflict)
+        ));
+        assert!(matches!(
+            db.store()
+                .set_task_visibility(&uid(3), &task_id, "archived", T0)
+                .await,
+            Err(StoreError::Forbidden)
+        ));
+        db.store().leave_room(&member, &code).await.unwrap();
+        db.store().disband_room(&owner, &code).await.unwrap();
+        let archived = db
+            .store()
+            .set_task_visibility(&owner, &task_id, "archived", T0)
+            .await
+            .unwrap();
+        assert!(!archived.purged);
+        assert_eq!(archived.notify, vec![owner.clone(), member.clone()]);
+        let retry = db
+            .store()
+            .set_task_visibility(&owner, &task_id, "archived", T0)
+            .await
+            .unwrap();
+        assert!(retry.notify.is_empty());
+        let sender_tasks = db.store().sync(&owner, T0).await.unwrap().tasks;
+        assert_eq!(sender_tasks[0].from_visibility, "archived");
+        assert_eq!(sender_tasks[0].to_visibility, "active");
+        db.store()
+            .set_task_visibility(&owner, &task_id, "active", T0)
+            .await
+            .unwrap();
+        db.store()
+            .set_task_visibility(&owner, &task_id, "archived", T0)
+            .await
+            .unwrap();
+        assert!(
+            !db.store()
+                .set_task_visibility(&owner, &task_id, "deleted", T0)
+                .await
+                .unwrap()
+                .purged
+        );
+        assert!(db.store().sync(&owner, T0).await.unwrap().tasks.is_empty());
+        assert!(matches!(
+            db.store().get_task(&owner, &task_id, T0).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            db.store()
+                .set_task_visibility(&owner, &task_id, "active", T0)
+                .await,
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(
+            db.store()
+                .get_task(&member, &task_id, T0)
+                .await
+                .unwrap()
+                .brief,
+            "private brief"
+        );
+        db.store()
+            .set_task_visibility(&member, &task_id, "archived", T0)
+            .await
+            .unwrap();
+        assert!(
+            db.store()
+                .set_task_visibility(&member, &task_id, "deleted", T0)
+                .await
+                .unwrap()
+                .purged
+        );
+        let raw = db.raw();
+        let count: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let tombstones: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM task_tombstones WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstones, 1);
+        assert!(
+            db.store()
+                .set_task_visibility(&member, &task_id, "deleted", T0)
+                .await
+                .unwrap()
+                .purged
+        );
+        assert!(matches!(
+            db.store()
+                .send_task(
+                    &owner,
+                    &task_id,
+                    &code,
+                    &member,
+                    "e",
+                    "title",
+                    "private brief",
+                    T0
+                )
+                .await,
+            Err(StoreError::Conflict)
+        ));
+        db.store().delete_expired(T0 + TASK_TTL_MS).await.unwrap();
+        let tombstones: i64 = raw
+            .query_row("SELECT COUNT(*) FROM task_tombstones", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tombstones, 0);
+    }
+
+    #[tokio::test]
+    async fn permanently_deleted_recipient_cannot_get_or_respond() {
+        let db = TestDb::new();
+        let owner = uid(1);
+        let member = uid(2);
+        let code = create_room(&db, &owner, "room").await;
+        db.store().join_room(&member, "B", &code, T0).await.unwrap();
+        let task_id = tid(902);
+        db.store()
+            .send_task(&owner, &task_id, &code, &member, "e", "t", "b", T0)
+            .await
+            .unwrap();
+        db.store()
+            .set_task_visibility(&member, &task_id, "archived", T0)
+            .await
+            .unwrap();
+        db.store()
+            .set_task_visibility(&member, &task_id, "deleted", T0)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.store().get_task(&member, &task_id, T0).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            db.store()
+                .respond_task(&member, &task_id, STATUS_ACCEPTED, || T0)
+                .await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(
+            !db.store()
+                .set_task_visibility(&member, &task_id, "deleted", T0)
+                .await
+                .unwrap()
+                .purged
+        );
+        assert_eq!(db.store().sync(&owner, T0).await.unwrap().tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_is_atomic_and_reused_ids_do_not_keep_expired_tombstones() {
+        let db = TestDb::new();
+        let owner = uid(1);
+        let member = uid(2);
+        let code = create_room(&db, &owner, "room").await;
+        db.store().join_room(&member, "B", &code, T0).await.unwrap();
+        let task_id = tid(903);
+        for now in [T0, T0 + TASK_TTL_MS] {
+            db.store()
+                .send_task(&owner, &task_id, &code, &member, "e", "t", "b", now)
+                .await
+                .unwrap();
+            db.store()
+                .set_task_visibility(&owner, &task_id, "archived", now)
+                .await
+                .unwrap();
+            db.store()
+                .set_task_visibility(&owner, &task_id, "deleted", now)
+                .await
+                .unwrap();
+            db.store()
+                .set_task_visibility(&member, &task_id, "archived", now)
+                .await
+                .unwrap();
+            if now == T0 {
+                let raw = db.raw();
+                raw.execute_batch("CREATE TRIGGER reject_task_purge BEFORE DELETE ON tasks BEGIN SELECT RAISE(ABORT, 'test rollback'); END;").unwrap();
+                assert!(matches!(
+                    db.store()
+                        .set_task_visibility(&member, &task_id, "deleted", now)
+                        .await,
+                    Err(StoreError::Internal(_))
+                ));
+                let retained = task_row(&raw, &task_id).unwrap().unwrap();
+                assert_eq!(retained.to_visibility, "archived");
+                assert_eq!(retained.brief, "b");
+                let count: i64 = raw
+                    .query_row("SELECT COUNT(*) FROM task_tombstones", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(count, 0);
+                raw.execute_batch("DROP TRIGGER reject_task_purge").unwrap();
+            }
+            assert!(
+                db.store()
+                    .set_task_visibility(&member, &task_id, "deleted", now)
+                    .await
+                    .unwrap()
+                    .purged
+            );
+        }
     }
 
     #[tokio::test]
@@ -1129,14 +1589,83 @@ mod tests {
         let code = create_room(&db, &owner, "old").await;
         db.store().join_room(&member, "B", &code, T0).await.unwrap();
 
-        let changed = db.store().hello(&member, "B2").await.unwrap();
+        let changed = db.store().hello(&member, "B2", None).await.unwrap();
         assert!(changed.name_changed);
         assert_eq!(changed.peers, vec![owner.clone(), member.clone()]);
-        let unchanged = db.store().hello(&member, "B2").await.unwrap();
+        let unchanged = db.store().hello(&member, "B2", None).await.unwrap();
         assert!(!unchanged.name_changed);
         assert_eq!(unchanged.peers.len(), 2);
         let sync = db.store().sync(&member, T0).await.unwrap();
         assert_eq!(sync.rooms[0].members[1].display_name, "B2");
+    }
+
+    #[tokio::test]
+    async fn environments_are_advertised_without_paths() {
+        let db = TestDb::new();
+        let owner = uid(1);
+        let member = uid(2);
+        let code = create_room(&db, &owner, "room").await;
+        db.store().join_room(&member, "B", &code, T0).await.unwrap();
+
+        let frontend = EnvView {
+            key: "frontend".into(),
+            label: "前端".into(),
+        };
+        db.store()
+            .hello(&member, "B", Some(vec![frontend.clone()]))
+            .await
+            .unwrap();
+        let sync = db.store().sync(&owner, T0).await.unwrap();
+        let advertised = &sync.rooms[0].members[1].environments;
+        assert_eq!(advertised, &vec![frontend]);
+
+        let backend = EnvView {
+            key: "backend".into(),
+            label: "后端".into(),
+        };
+        db.store()
+            .set_environments(&member, vec![backend.clone()])
+            .await
+            .unwrap();
+        let sync = db.store().sync(&owner, T0).await.unwrap();
+        assert_eq!(&sync.rooms[0].members[1].environments, &vec![backend]);
+
+        // A hello without the field must not erase an advertised list.
+        db.store().hello(&member, "B", None).await.unwrap();
+        let sync = db.store().sync(&owner, T0).await.unwrap();
+        assert_eq!(sync.rooms[0].members[1].environments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_env_must_be_in_the_recipient_advertised_list() {
+        let db = TestDb::new();
+        let owner = uid(1);
+        let member = uid(2);
+        let code = create_room(&db, &owner, "room").await;
+        db.store().join_room(&member, "B", &code, T0).await.unwrap();
+        db.store()
+            .set_environments(
+                &member,
+                vec![EnvView {
+                    key: "frontend".into(),
+                    label: "前端".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let mismatch = db
+            .store()
+            .send_task(&owner, &tid(200), &code, &member, "backend", "t", "b", T0)
+            .await;
+        assert!(matches!(mismatch, Err(StoreError::Invalid)));
+
+        let accepted = db
+            .store()
+            .send_task(&owner, &tid(201), &code, &member, "frontend", "t", "b", T0)
+            .await
+            .unwrap();
+        assert_eq!(accepted.task.env, "frontend");
     }
 
     #[tokio::test]
@@ -1435,6 +1964,19 @@ mod tests {
                 .unwrap_err(),
             StoreError::CapacityExceeded
         ));
+        let task_id = tid(1000);
+        db.store()
+            .set_task_visibility(&first, &task_id, "archived", T0)
+            .await
+            .unwrap();
+        db.store()
+            .set_task_visibility(&first, &task_id, "deleted", T0)
+            .await
+            .unwrap();
+        db.store()
+            .send_task(&owner, &tid(2000), &code, &first, "e", "t", "b", T0)
+            .await
+            .expect("deleting own pending item frees inbox capacity");
     }
 
     #[tokio::test]
@@ -1481,6 +2023,19 @@ mod tests {
                 .unwrap_err(),
             StoreError::CapacityExceeded
         ));
+        let task_id = tid(10_000);
+        db.store()
+            .set_task_visibility(&owner, &task_id, "archived", T0)
+            .await
+            .unwrap();
+        db.store()
+            .set_task_visibility(&owner, &task_id, "deleted", T0)
+            .await
+            .unwrap();
+        db.store()
+            .send_task(&owner, &tid(20_000), &fifth_room, &fifth, "e", "t", "b", T0)
+            .await
+            .expect("deleting own outgoing item frees related capacity");
     }
 
     #[tokio::test]
@@ -1546,6 +2101,77 @@ mod tests {
     }
 
     #[test]
+    fn version_one_and_two_migrations_preserve_existing_data() {
+        for source_version in [1_i64, 2_i64] {
+            let path = std::env::temp_dir().join(format!(
+                "baton-migrate-test-{}-{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(
+                "CREATE TABLE rooms (code TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT NOT NULL, created_at INTEGER NOT NULL);\
+                 CREATE TABLE members (room_code TEXT NOT NULL, user_id TEXT NOT NULL, display_name TEXT NOT NULL, joined_at INTEGER NOT NULL, PRIMARY KEY (room_code, user_id), FOREIGN KEY (room_code) REFERENCES rooms(code) ON DELETE CASCADE);\
+                 CREATE TABLE tasks (task_id TEXT PRIMARY KEY, room TEXT NOT NULL, from_user TEXT NOT NULL, from_name TEXT NOT NULL, to_user TEXT NOT NULL, to_name TEXT NOT NULL, env TEXT NOT NULL, title TEXT NOT NULL, brief TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+                conn.execute_batch(
+                "INSERT INTO rooms VALUES ('ABCD23','Team','sender',1);\
+                 INSERT INTO members VALUES ('ABCD23','sender','A',1);\
+                 INSERT INTO tasks VALUES ('task','ABCD23','sender','A','recipient','B','e','title','private brief','pending',1,100);",
+            ).unwrap();
+                if source_version == 2 {
+                    conn.execute_batch("CREATE TABLE profiles (user_id TEXT PRIMARY KEY, environments TEXT NOT NULL DEFAULT '[]');\
+                    INSERT INTO profiles VALUES ('sender','[{\"key\":\"e\",\"label\":\"Environment\"}]');").unwrap();
+                }
+                conn.pragma_update(None, "user_version", source_version)
+                    .unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            drop(store);
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 3);
+            let profiles: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'profiles'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(profiles, 1);
+            let task = task_row(&conn, "task").unwrap().unwrap();
+            assert_eq!(task.brief, "private brief");
+            assert_eq!(task.from_visibility, "active");
+            assert_eq!(task.to_visibility, "active");
+            assert_eq!(
+                member_name(&conn, "ABCD23", "sender").unwrap().as_deref(),
+                Some("A")
+            );
+            if source_version == 2 {
+                let environments: String = conn
+                    .query_row(
+                        "SELECT environments FROM profiles WHERE user_id = 'sender'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(decode_environments(&environments)[0].key, "e");
+            }
+            drop(conn);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+            let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        }
+    }
+
+    #[test]
     fn higher_schema_version_is_refused() {
         let path = std::env::temp_dir().join(format!(
             "baton-schema-test-{}-{}.db",
@@ -1557,10 +2183,10 @@ mod tests {
         ));
         {
             let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 2_i64).unwrap();
+            conn.pragma_update(None, "user_version", 4_i64).unwrap();
         }
         match Store::open(&path) {
-            Err(StoreError::UnsupportedSchema(version)) => assert_eq!(version, 2),
+            Err(StoreError::UnsupportedSchema(version)) => assert_eq!(version, 4),
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("higher schema version must fail startup"),
         }
@@ -1576,19 +2202,19 @@ mod tests {
         let version: i64 = raw
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 3);
         let journal: String = raw
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal.to_ascii_lowercase(), "wal");
         let tables: i64 = raw
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('rooms','members','tasks')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('rooms','members','profiles','tasks')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 3);
+        assert_eq!(tables, 4);
     }
 
     #[test]
@@ -1607,6 +2233,8 @@ mod tests {
             env: "e".into(),
             title: "t".into(),
             status: STATUS_PENDING.into(),
+            from_visibility: "active".into(),
+            to_visibility: "active".into(),
             created_at: T0,
             expires_at: T0 + TASK_TTL_MS,
         };

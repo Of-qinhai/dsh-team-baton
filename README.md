@@ -43,6 +43,14 @@ detail/approval. On narrow screens it becomes list → detail. Sending, room
 management, and manual review each have their own dialog. A failed send keeps its
 draft; an unknown result keeps the original `taskId` until confirmed.
 
+Each install configures directories in the panel and advertises only environment
+keys and labels to room peers. Senders select a recipient environment; its actual
+canonical path stays on the recipient's machine and is confirmed before execution.
+Tasks support deleted-items archiving, restore and separately confirmed permanent
+deletion by each participant. Both confirmations remove the live task content,
+while linked DSH sessions remain. The left navigation collapses, and all three
+task tabs scroll within the panel on narrow screens and short desktop windows.
+
 The panel UI strings are currently Chinese; the protocol and code are
 language-neutral.
 
