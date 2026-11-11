@@ -31,7 +31,7 @@ import { pathToFileURL } from 'node:url'
 const { validateServerUrl } = await import(pathToFileURL(process.argv[3]))
 const value = process.env.BATON_PACKAGE_SERVER_URL ?? ''
 const serverUrl = value ? validateServerUrl(value) : ''
-writeFileSync(process.argv[2], '- insert:\n    - id: baton\n      name: \'@token-team/dsh-baton\'\n      config:\n        serverUrl: ' + JSON.stringify(serverUrl) + '\n')
+writeFileSync(process.argv[2], '- insert:\n    - id: baton\n      name: \'@ohmynpm/dsh-baton\'\n      config:\n        serverUrl: ' + JSON.stringify(serverUrl) + '\n')
 NODE
 
 cat > "$OUT/INSTALL.md" <<'MD'
@@ -98,7 +98,7 @@ plugin_manager install_bundle target=/绝对路径/dsh-baton-<版本>
 
 ```yaml
 - id: baton
-  name: '@token-team/dsh-baton'
+  name: '@ohmynpm/dsh-baton'
   config:
     serverUrl: wss://baton.example.com/ws
     displayName: 你的名字
