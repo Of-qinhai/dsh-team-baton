@@ -10,11 +10,12 @@ window.__ModuleLoader__.load({
     const { useCallback, useEffect, useRef, useState, useSyncExternalStore } = React
     const API = '/api/baton'
     const CSS = `
-.bt-trigger{display:flex;align-items:center;gap:8px;border:0;background:transparent;color:inherit;padding:7px 10px;border-radius:8px;font:inherit;cursor:pointer}
-.bt-trigger:hover{background:color-mix(in srgb,currentColor 7%,transparent)}
-.bt-trigger svg{color:#568472}
 .bt-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:5px;background:#dcece3;color:#315c48;font-size:10px;font-weight:700}
-.bt-trigger .bt-count{margin-left:2px}
+.bt-panel-page{height:100%;min-height:0;display:flex;background:var(--dsw-alias-bg,transparent);overflow:hidden}
+.bt-shell.bt-embedded{width:100%;height:100%;min-height:0;max-height:none;border:0;border-radius:0;box-shadow:none;animation:none}
+.bt-nav-icon{position:relative;display:flex;align-items:center;justify-content:center;flex:none}
+.bt-nav-icon .bt-icon{width:100%;height:100%}
+.bt-nav-badge{position:absolute;top:-4px;right:-5px;min-width:13px;height:13px;padding:0 3px;border-radius:7px;background:#315f4d;color:#fff;font-size:8px;font-weight:700;display:flex;align-items:center;justify-content:center;line-height:1}
 .bt-icon-button.copied,.bt-button.copied{color:#315c48;background:var(--bt-tint)}
 .bt-combo{position:relative}
 .bt-combo-menu{position:absolute;z-index:8;left:0;right:0;top:calc(100% + 4px);max-height:190px;overflow:auto;padding:4px;border:1px solid var(--bt-line);border-radius:8px;background:var(--bt-bg);box-shadow:0 12px 30px rgb(12 30 21 / 14%)}
@@ -320,26 +321,33 @@ window.__ModuleLoader__.load({
       ]))
     }
 
-    function Trigger() {
-      const isOpen = useSyncExternalStore(subscribe, openSnapshot)
+    function SidebarBatonIcon({ size = 18, active = false }) {
       const attention = useSyncExternalStore(subscribeCount, countSnapshot)
       useEffect(() => {
-        if (isOpen) return undefined
-        let active = true
+        if (active) return undefined
+        let mounted = true
         let timer
         async function poll() {
           try {
             const result = await call({ action: 'counts' })
-            if (active) setAttentionCount(result.attention)
+            if (mounted) setAttentionCount(result.attention)
           } catch {}
-          if (active) timer = setTimeout(poll, 15000)
+          if (mounted) timer = setTimeout(poll, 15000)
         }
         poll()
-        return () => { active = false; clearTimeout(timer) }
-      }, [isOpen])
-      const badge = attention > 0 ? h('span', { key: 'c', className: 'bt-count', 'aria-hidden': true }, attention > 99 ? '99+' : attention) : null
-      return h('button', { className: 'bt-trigger', type: 'button', title: attention > 0 ? attention + ' 条待处理' : '打开接力', 'aria-label': attention > 0 ? '打开接力，' + attention + ' 条待处理' : '打开接力', 'aria-expanded': isOpen, onClick: () => setOpen(!isOpen) }, [h(Icon, { key: 'i', name: 'inbox' }), h('span', { key: 't' }, '接力'), badge])
+        return () => { mounted = false; clearTimeout(timer) }
+      }, [active])
+      return h('span', {
+        className: 'bt-nav-icon', style: { width: size, height: size },
+        title: attention > 0 ? attention + ' 条待处理' : '接力',
+        'aria-hidden': true,
+      }, [
+        h(Icon, { key: 'i', name: 'inbox' }),
+        attention > 0 ? h('span', { key: 'b', className: 'bt-nav-badge' }, attention > 9 ? '9+' : attention) : null,
+      ])
     }
+
+    function MainPanel() { return h(Panel, { embedded: true }) }
 
     function EnvPicker({ value, options, disabled, onChange }) {
       const [open, setOpen] = useState(false)
@@ -388,8 +396,9 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    function Panel() {
+    function Panel({ embedded = false } = {}) {
       const isOpen = useSyncExternalStore(subscribe, openSnapshot)
+      const active = embedded || isOpen
       const [data, setData] = useState(null)
       const [tab, setTab] = useState('incoming')
       const [roomCode, setRoomCode] = useState('')
@@ -412,7 +421,7 @@ window.__ModuleLoader__.load({
       const detailSequence = useRef(0)
       const selectedRef = useRef(selected)
       selectedRef.current = selected
-      const onKeyDown = useFocusTrap(ref, isOpen && !modal, () => setOpen(false))
+      const onKeyDown = useFocusTrap(ref, embedded ? false : (isOpen && !modal), () => setOpen(false))
 
       const refresh = useCallback(async () => {
         const sequence = ++refreshSequence.current
@@ -425,13 +434,13 @@ window.__ModuleLoader__.load({
       }, [])
 
       useEffect(() => {
-        if (!isOpen) return undefined
+        if (!active) return undefined
         let timer
         let active = true
         async function poll() { await refresh(); if (active) timer = setTimeout(poll, 5000) }
         poll()
         return () => { active = false; clearTimeout(timer) }
-      }, [isOpen, refresh])
+      }, [active, refresh])
 
       const online = data?.connection?.state === 'online'
       const rooms = data?.rooms ?? []
@@ -555,7 +564,7 @@ window.__ModuleLoader__.load({
         setNotice({ tone: 'success', message: '投递已确认。' })
       }
 
-      if (!isOpen) return null
+      if (!active) return null
 
       const renderTask = item => {
         const inbound = tab === 'incoming'
@@ -670,8 +679,8 @@ window.__ModuleLoader__.load({
         return h(Dialog, { title, description, close: modalClose, footer: [cancel, h(Button, { key: 'ok', tone: modal.kind === 'handled' ? 'primary' : 'danger', busy: !!busy, disabled: !!busy || !online, onClick: async () => { const result = await run(modal.task ? { action: modal.kind, taskId: modal.task.taskId, confirmed: true } : { action: modal.kind, code: modal.room.code }); if (result.ok) { setModal(null); if (modal.room?.code === roomCode) setRoomCode(''); setNotice({ tone: 'success', message: modal.kind === 'handled' ? '已标记为自行处理。' : modal.kind === 'decline' ? '已拒绝这次接力。' : '房间已更新。' }) } } }, label)] }, h('p', { style: { margin: 0, color: 'var(--bt-muted)', fontSize: 12, lineHeight: 1.8 } }, modal.task?.title ?? modal.room?.name))
       }
 
-      return h('div', { className: 'bt-backdrop', onMouseDown: event => { if (event.target === event.currentTarget && !modal) setOpen(false) } }, h('section', { ref, onKeyDown, className: 'bt-shell', role: 'dialog', 'aria-modal': true, 'aria-label': 'Baton 接力', style: { position: 'relative' } }, [
-        h('header', { key: 'top', className: 'bt-topbar' }, [h('div', { key: 'brand', className: 'bt-brand' }, [h('span', { key: 'mark', className: 'bt-mark', 'aria-hidden': true }), h('span', { key: 'name', className: 'bt-wordmark' }, ['Baton', h('small', { key: 'cn' }, '接力')])]), h('div', { key: 'actions', className: 'bt-top-actions' }, [h('button', { key: 'rooms', className: 'bt-icon-button bt-mobile-back', type: 'button', 'aria-label': '协作房间', onClick: () => setModal({ kind: 'rooms' }) }, h(Icon, { name: 'people' })), h('span', { key: 'status', className: 'bt-connection', role: 'status' }, [h('span', { key: 'dot', className: 'bt-dot' + (online ? ' online' : '') }), connectionText]), h('span', { key: 'line', className: 'bt-divider' }), h(IconButton, { key: 'refresh', label: '刷新接力', icon: 'refresh', onClick: refresh }), h(IconButton, { key: 'close', label: '关闭接力', icon: 'close', onClick: () => setOpen(false) })])]),
+      const shell = h('section', { ref, onKeyDown, className: 'bt-shell' + (embedded ? ' bt-embedded' : ''), role: embedded ? undefined : 'dialog', 'aria-modal': embedded ? undefined : true, 'aria-label': 'Baton 接力', style: { position: 'relative' } }, [
+        h('header', { key: 'top', className: 'bt-topbar' }, [h('div', { key: 'brand', className: 'bt-brand' }, [h('span', { key: 'mark', className: 'bt-mark', 'aria-hidden': true }), h('span', { key: 'name', className: 'bt-wordmark' }, ['Baton', h('small', { key: 'cn' }, '接力')])]), h('div', { key: 'actions', className: 'bt-top-actions' }, [h('button', { key: 'rooms', className: 'bt-icon-button bt-mobile-back', type: 'button', 'aria-label': '协作房间', onClick: () => setModal({ kind: 'rooms' }) }, h(Icon, { name: 'people' })), h('span', { key: 'status', className: 'bt-connection', role: 'status' }, [h('span', { key: 'dot', className: 'bt-dot' + (online ? ' online' : '') }), connectionText]), h('span', { key: 'line', className: 'bt-divider' }), h(IconButton, { key: 'refresh', label: '刷新接力', icon: 'refresh', onClick: refresh }), embedded ? null : h(IconButton, { key: 'close', label: '关闭接力', icon: 'close', onClick: () => setOpen(false) })])]),
         h('div', { key: 'body', className: 'bt-body' }, [
           h('aside', { key: 'sidebar', className: 'bt-sidebar', 'aria-label': '协作房间' }, [
             h('div', { key: 'caption', className: 'bt-nav-caption' }, 'WORKSPACE'),
@@ -699,7 +708,9 @@ window.__ModuleLoader__.load({
           ]),
         ]),
         h(React.Fragment, { key: 'modal' }, renderModal()),
-      ]))
+      ])
+      if (embedded) return h('div', { className: 'bt-panel-page' }, shell)
+      return h('div', { className: 'bt-backdrop', onMouseDown: event => { if (event.target === event.currentTarget && !modal) setOpen(false) } }, shell)
     }
 
     return {
@@ -716,8 +727,8 @@ window.__ModuleLoader__.load({
           if (!uiWorkspace?.openSession) throw new Error('会话导航服务尚未就绪。')
           return uiWorkspace.openSession(sessionId)
         }
-        ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: 'baton-trigger', order: 20, label: '接力' }, Trigger))
-        ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'baton-panel', order: 60 }, Panel))
+        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'baton', order: 15, label: '接力' }, SidebarBatonIcon))
+        ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'baton' }, MainPanel))
       },
     }
   },
